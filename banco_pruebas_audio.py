@@ -4,16 +4,17 @@
 ===============================================================================
  BANCO DE PRUEBAS VIRTUAL PARA AMPLIFICADORES DE AUDIO DE POTENCIA (Clase AB)
 ===============================================================================
- Instrumentación virtual en Python: PyQt5 + Matplotlib + NumPy + SciPy + PyVISA
+ Instrumentación virtual en Python: PyQt5 + Matplotlib + NumPy + SciPy
 
  Módulos:
-   1. Conexión ............. osciloscopio o modo simulador.
+   1. Conexión ............. VISA/SCPI, Hantek 6022BE USB o simulador.
    2. Comparación .......... señales de entrada/salida, ganancia, fase y THD.
 
  Dependencias:
      pip install pyqt5 matplotlib numpy scipy pyvisa pyvisa-py
  (pyvisa-py es opcional si ya tiene NI-VISA / Keysight IO Libraries instalado.
   Para USB con pyvisa-py instale además: pip install pyusb)
+ Para el Hantek 6022BE: pip install pyhantek (requiere Python 3.10 o posterior).
 
  Ejecución:
      python banco_pruebas_audio.py
@@ -21,7 +22,9 @@
 """
 
 import csv
+import importlib
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from itertools import zip_longest
@@ -303,6 +306,114 @@ class OsciloscopioVISA(InstrumentoBase):
             pass
 
 
+class OsciloscopioHantek6022BE(InstrumentoBase):
+    """Captura simultáneamente CH1 y CH2 del Hantek 6022BE por USB."""
+
+    MUESTRAS = 10000
+    MUESTRAS_INICIALES = 2048
+    CODIGOS_CONTROL = {
+        "ganancia_ch1": 0xE0,
+        "ganancia_ch2": 0xE1,
+        "frecuencia_muestreo": 0xE2,
+        "numero_canales": 0xE4,
+        "acoplamiento": 0xE5,
+        "frecuencia_calibracion": 0xE6,
+    }
+
+    def __init__(self, encontrado, escalas, sondas):
+        self.modelo = encontrado.model
+        scope_device = importlib.import_module("pyhantek.device").ScopeDevice
+        self.dispositivo = scope_device(encontrado)
+        try:
+            self.calibracion = self._leer_calibracion()
+            self._configurar(escalas, sondas)
+        except Exception:
+            self.dispositivo.close()
+            raise
+
+    def identificar(self) -> str:
+        return f"Hantek {self.modelo.name}, serie {self.dispositivo.serial}"
+
+    def _leer_calibracion(self):
+        datos = self.dispositivo.read_calibration()
+        if not datos or len(datos) < 80:
+            return None
+        return np.frombuffer(datos[:80], dtype=np.uint8).reshape(5, 8, 2)
+
+    def _configurar(self, escalas, sondas):
+        self.canales_cfg = []
+        for canal, (escala, sonda) in enumerate(zip(escalas, sondas)):
+            indice = self.modelo.gain_index_for(escala / sonda)
+            paso = self.modelo.gain_steps[indice]
+            self.dispositivo.control(
+                self.CODIGOS_CONTROL[f"ganancia_ch{canal + 1}"],
+                bytes((paso.hw_gain, indice)))
+            self.canales_cfg.append((indice, sonda))
+
+        self.indice_muestreo = next(
+            i for i, tasa in enumerate(self.modelo.sample_rates)
+            if tasa.rate == 1e6)
+        self.tasa = self.modelo.sample_rates[self.indice_muestreo]
+        self.dispositivo.control(
+            self.CODIGOS_CONTROL["frecuencia_muestreo"],
+            bytes((self.tasa.sample_id, self.indice_muestreo)))
+        self.dispositivo.control(self.CODIGOS_CONTROL["numero_canales"], b"\x02")
+        self.dispositivo.control(self.CODIGOS_CONTROL["acoplamiento"], b"\x11")
+        self.dispositivo.control(
+            self.CODIGOS_CONTROL["frecuencia_calibracion"], b"\x01")
+
+    def _escala_adc(self, indice, canal):
+        if self.calibracion is None:
+            return 128.0, 1.0
+        offset = int(self.calibracion[0, indice, canal])
+        fine = int(self.calibracion[3, indice, canal])
+        if offset in (0, 255):
+            cero = 128.0
+        elif fine in (0, 255):
+            cero = float(offset)
+        else:
+            cero = offset + (fine - 128) / 250.0
+        g = int(self.calibracion[2, indice, canal])
+        factor = 1.0 if g in (0, 255) else 1.0 + (g - 128) / 500.0
+        return cero, factor
+
+    def capturar_varios(self, canales):
+        if not canales or any(canal not in (1, 2) for canal in canales):
+            raise ValueError("El Hantek 6022BE solo tiene CH1 y CH2.")
+        tasa = self.tasa
+        muestras_por_canal = (
+            self.MUESTRAS * tasa.oversampling + self.MUESTRAS_INICIALES)
+        muestras_por_canal = ((muestras_por_canal + 511) // 512) * 512
+        omitir = muestras_por_canal - self.MUESTRAS * tasa.oversampling
+        total_bytes = muestras_por_canal * 2
+        try:
+            datos = self.dispositivo.read(
+                total_bytes,
+                tasa.rate * tasa.oversampling * 2,
+                threading.Event())
+        finally:
+            self.dispositivo.stop_sampling()
+        if datos is None or len(datos) != total_bytes:
+            raise RuntimeError("El Hantek no entregó una captura completa.")
+
+        intercalados = np.asarray(datos, dtype=np.uint8).reshape(-1, 2)
+        tiempo = np.arange(self.MUESTRAS, dtype=float) / tasa.rate
+        resultado = {}
+        for canal in set(canales):
+            indice, sonda = self.canales_cfg[canal - 1]
+            muestras = intercalados[omitir:, canal - 1]
+            n = (muestras.size // tasa.oversampling) * tasa.oversampling
+            muestras = muestras[:n].reshape(-1, tasa.oversampling).mean(axis=1)
+            cero, factor = self._escala_adc(indice, canal - 1)
+            voltios = ((muestras - cero) * factor
+                       * sonda / self.modelo.voltage_scale[indice])
+            resultado[canal] = (tiempo.copy(), voltios)
+        return resultado
+
+    def cerrar(self):
+        self.dispositivo.close()
+
+
 class OsciloscopioSimulado(InstrumentoBase):
     """
     Simulador de un amplificador Clase AB + osciloscopio.
@@ -436,21 +547,25 @@ class LienzoMpl(QWidget):
 
 
 # =============================================================================
-#  PANEL 1: CONEXIÓN VISA
+#  PANEL 1: CONEXIÓN
 # =============================================================================
 class PanelConexion(QGroupBox):
-    """Escaneo de recursos VISA, prueba *IDN? y modo Simulador."""
+    """Conexión por VISA o USB Hantek, además del modo Simulador."""
     conexion_cambiada = pyqtSignal(bool)
     mensaje = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__("1. Conexión", parent)
         self._rm = None
-        self._instrumento: Optional[OsciloscopioVISA] = None
+        self._instrumento: Optional[InstrumentoBase] = None
         self._sim = OsciloscopioSimulado()
         self._tarea: Optional[TareaAsync] = None
+        self._hantek_encontrados = {}
 
         self.chk_demo = QCheckBox("Modo Simulador / Demo")
+        self.cmb_tipo = QComboBox()
+        self.cmb_tipo.addItem("VISA / SCPI", "visa")
+        self.cmb_tipo.addItem("Hantek 6022BE (USB)", "hantek")
         self.cmb_recursos = QComboBox()
         self.cmb_recursos.setEditable(True)
         self.cmb_recursos.setMinimumWidth(320)
@@ -471,25 +586,64 @@ class PanelConexion(QGroupBox):
         self.lbl_idn = QLabel("Sin conexión")
         self.lbl_idn.setStyleSheet("font-weight: bold;")
 
+        self.grp_hantek = QGroupBox("Ajustes del Hantek (por división)")
+        h = QHBoxLayout(self.grp_hantek)
+        self.cmb_escala_ch1 = self._combo_escalas()
+        self.cmb_escala_ch1.setCurrentIndex(7)
+        self.cmb_escala_ch2 = self._combo_escalas()
+        self.cmb_escala_ch2.setCurrentIndex(4)
+        self.cmb_sonda_ch1 = self._combo_sondas()
+        self.cmb_sonda_ch2 = self._combo_sondas()
+        for etiqueta, control in (
+                ("CH1 salida:", self.cmb_escala_ch1),
+                ("Sonda:", self.cmb_sonda_ch1),
+                ("CH2 entrada:", self.cmb_escala_ch2),
+                ("Sonda:", self.cmb_sonda_ch2)):
+            h.addWidget(QLabel(etiqueta))
+            h.addWidget(control)
+        self.grp_hantek.setVisible(False)
+
         g = QGridLayout(self)
         g.addWidget(QLabel("Osciloscopio:"), 0, 0)
         g.addWidget(self.cmb_recursos, 0, 1, 1, 3)
         g.addWidget(self.btn_escanear, 0, 4)
+        g.addWidget(self.cmb_tipo, 1, 0)
         g.addWidget(self.cmb_escala, 1, 1)
         g.addWidget(self.btn_conectar, 1, 2)
         g.addWidget(self.btn_desconectar, 1, 3)
         g.addWidget(self.chk_demo, 1, 4)
         g.addWidget(QLabel("Estado:"), 2, 0)
         g.addWidget(self.lbl_idn, 2, 1, 1, 4)
+        g.addWidget(self.grp_hantek, 3, 0, 1, 5)
 
+        self.cmb_tipo.currentIndexChanged.connect(self._cambio_tipo)
         self.btn_escanear.clicked.connect(self._escanear)
         self.btn_conectar.clicked.connect(self._conectar)
         self.btn_desconectar.clicked.connect(self._desconectar)
         self.chk_demo.toggled.connect(self._cambio_demo)
 
+        self._cambio_tipo()
         if not VISA_DISPONIBLE:
             self.lbl_idn.setText("PyVISA no instalado (pip install pyvisa pyvisa-py). "
                                  "Use el modo Simulador.")
+
+    @staticmethod
+    def _combo_escalas():
+        combo = QComboBox()
+        for valor, etiqueta in (
+                (0.02, "20 mV/div"), (0.05, "50 mV/div"),
+                (0.1, "100 mV/div"), (0.2, "200 mV/div"),
+                (0.5, "500 mV/div"), (1.0, "1 V/div"),
+                (2.0, "2 V/div"), (5.0, "5 V/div")):
+            combo.addItem(etiqueta, valor)
+        return combo
+
+    @staticmethod
+    def _combo_sondas():
+        combo = QComboBox()
+        combo.addItem("×1", 1)
+        combo.addItem("×10", 10)
+        return combo
 
     # ---- API pública -------------------------------------------------------
     def es_demo(self) -> bool:
@@ -505,11 +659,14 @@ class PanelConexion(QGroupBox):
     def estilo_escala(self) -> str:
         return self.cmb_escala.currentData()
 
+    def es_hantek(self) -> bool:
+        return self.cmb_tipo.currentData() == "hantek"
+
     def conexion_perdida(self, detalle: str):
         """Llamado cuando una captura falla con instrumento real."""
         self._cerrar_instrumento()
         self.lbl_idn.setText("⚠ Conexión perdida")
-        self.btn_desconectar.setEnabled(False)
+        self._set_ocupado(False)
         self.conexion_cambiada.emit(False)
         self.mensaje.emit("Conexión perdida con el osciloscopio.")
         QMessageBox.warning(
@@ -519,11 +676,19 @@ class PanelConexion(QGroupBox):
 
     # ---- Lógica interna ----------------------------------------------------
     def _set_ocupado(self, ocupado: bool):
-        for w in (self.btn_escanear, self.btn_conectar, self.cmb_recursos,
-                  self.cmb_escala):
-            w.setEnabled(not ocupado and not self.es_demo())
-        self.btn_desconectar.setEnabled(not ocupado and self._instrumento is not None
-                                        and not self.es_demo())
+        disponible = not ocupado and not self.es_demo()
+        desconectado = self._instrumento is None
+        self.cmb_tipo.setEnabled(disponible and desconectado)
+        self.cmb_recursos.setEnabled(disponible and desconectado)
+        self.btn_escanear.setEnabled(disponible and desconectado)
+        self.btn_conectar.setEnabled(disponible and desconectado)
+        self.btn_desconectar.setEnabled(disponible and not desconectado)
+        self.cmb_escala.setEnabled(
+            disponible and desconectado and not self.es_hantek())
+        self.grp_hantek.setVisible(self.es_hantek() and not self.es_demo())
+        for w in (self.cmb_escala_ch1, self.cmb_escala_ch2,
+                  self.cmb_sonda_ch1, self.cmb_sonda_ch2):
+            w.setEnabled(disponible and desconectado and self.es_hantek())
 
     def _lanzar(self, funcion, ok, fallo):
         self._set_ocupado(True)
@@ -544,10 +709,38 @@ class PanelConexion(QGroupBox):
         return self._rm
 
     def _escanear(self):
+        if self.es_hantek():
+            self.mensaje.emit("Buscando Hantek 6022BE por USB…")
+            self._lanzar(self._buscar_hantek, self._escaneo_hantek_ok,
+                         lambda m: self._error("Error al buscar Hantek", m))
+            return
         self.mensaje.emit("Escaneando recursos VISA…")
         self._lanzar(lambda: list(self._obtener_rm().list_resources()),
                      self._escaneo_ok,
                      lambda m: self._error("Error al escanear", m))
+
+    @staticmethod
+    def _buscar_hantek():
+        try:
+            find_devices = importlib.import_module(
+                "pyhantek.device").find_devices
+        except ImportError as e:
+            raise RuntimeError(
+                "Falta el controlador Python del Hantek. Instálelo con "
+                "'pip install pyhantek'.") from e
+        return [d for d in find_devices()
+                if d.model.name == "DSO-6022BE"]
+
+    def _escaneo_hantek_ok(self, encontrados):
+        self._hantek_encontrados = {d.label: d for d in encontrados}
+        self.cmb_recursos.clear()
+        self.cmb_recursos.addItems(list(self._hantek_encontrados))
+        if encontrados:
+            self.mensaje.emit(
+                f"{len(encontrados)} Hantek 6022BE encontrado(s).")
+        else:
+            self.mensaje.emit(
+                "No se encontró el Hantek. Revise USB y el controlador WinUSB.")
 
     def _escaneo_ok(self, recursos: List[str]):
         actual = self.cmb_recursos.currentText()
@@ -562,6 +755,36 @@ class PanelConexion(QGroupBox):
                               "dirección a mano (p. ej. TCPIP0::IP::INSTR).")
 
     def _conectar(self):
+        if self.es_hantek():
+            encontrado = self._hantek_encontrados.get(
+                self.cmb_recursos.currentText())
+            if encontrado is None:
+                QMessageBox.information(
+                    self, "Conexión",
+                    "Pulse Escanear y seleccione el Hantek 6022BE.")
+                return
+            escalas = (self.cmb_escala_ch1.currentData(),
+                       self.cmb_escala_ch2.currentData())
+            sondas = (self.cmb_sonda_ch1.currentData(),
+                      self.cmb_sonda_ch2.currentData())
+            self._cerrar_instrumento()
+            self.mensaje.emit("Conectando al Hantek 6022BE…")
+
+            def tarea_hantek():
+                upload_firmware = importlib.import_module(
+                    "pyhantek.device").upload_firmware
+                if encontrado.needs_firmware:
+                    encontrado_actualizado = upload_firmware(encontrado)
+                else:
+                    encontrado_actualizado = encontrado
+                osc = OsciloscopioHantek6022BE(
+                    encontrado_actualizado, escalas, sondas)
+                return osc, osc.identificar()
+
+            self._lanzar(tarea_hantek, self._conexion_ok,
+                         lambda m: self._error("No se pudo conectar", m))
+            return
+
         recurso = self.cmb_recursos.currentText().strip()
         if not recurso:
             QMessageBox.information(self, "Conexión", "Seleccione o escriba un recurso VISA.")
@@ -583,14 +806,14 @@ class PanelConexion(QGroupBox):
     def _conexion_ok(self, resultado):
         self._instrumento, idn = resultado
         self.lbl_idn.setText(idn)
-        self.btn_desconectar.setEnabled(True)
+        self._set_ocupado(False)
         self.mensaje.emit("Conexión establecida.")
         self.conexion_cambiada.emit(True)
 
     def _desconectar(self):
         self._cerrar_instrumento()
         self.lbl_idn.setText("Sin conexión")
-        self.btn_desconectar.setEnabled(False)
+        self._set_ocupado(False)
         self.mensaje.emit("Desconectado.")
         self.conexion_cambiada.emit(False)
 
@@ -600,18 +823,27 @@ class PanelConexion(QGroupBox):
             self._instrumento = None
 
     def _cambio_demo(self, activo: bool):
-        for w in (self.btn_escanear, self.btn_conectar, self.cmb_recursos,
-                  self.cmb_escala):
-            w.setEnabled(not activo)
         if activo:
-            self.btn_desconectar.setEnabled(False)
             self.lbl_idn.setText("MODO DEMO — " + self._sim.identificar())
             self.conexion_cambiada.emit(True)
         else:
-            self.btn_desconectar.setEnabled(self._instrumento is not None)
             self.lbl_idn.setText(self._instrumento.identificar()
                                  if self._instrumento else "Sin conexión")
             self.conexion_cambiada.emit(self._instrumento is not None)
+        self._set_ocupado(False)
+
+    def _cambio_tipo(self):
+        if self.es_hantek():
+            self.cmb_recursos.setEditable(False)
+            self.cmb_recursos.setToolTip(
+                "Seleccione el Hantek 6022BE encontrado al escanear.")
+        else:
+            self.cmb_recursos.setEditable(True)
+            self.cmb_recursos.setToolTip(
+                "Recurso VISA, por ejemplo TCPIP0::192.168.1.50::INSTR.")
+        self.cmb_recursos.clear()
+        self._hantek_encontrados.clear()
+        self._set_ocupado(False)
 
     def _error(self, titulo: str, detalle: str):
         self.mensaje.emit(titulo)
@@ -884,8 +1116,13 @@ class PestanaMedicion(QWidget):
                     "El simulador usa CH2 como entrada y CH1 como salida.")
                 return False
             self._aplicar_params_sim()
-        else:
+        elif isinstance(inst, OsciloscopioVISA):
             inst.estilo = self.conexion.estilo_escala()
+        elif self._canal_entrada > 2 or self._canal_salida > 2:
+            QMessageBox.warning(
+                self, "Canales no disponibles",
+                "El Hantek 6022BE solo dispone de CH1 y CH2.")
+            return False
         canales = (self._canal_entrada, self._canal_salida)
         self._hilo = HiloCaptura(inst, canales, continuo,
                                  self.spn_periodo.value(), self)
