@@ -7,14 +7,14 @@
  Instrumentación virtual en Python: PyQt5 + Matplotlib + NumPy + SciPy
 
  Módulos:
-   1. Conexión ............. VISA/SCPI, Hantek 6022BE USB o simulador.
+   1. Conexión ............. VISA/SCPI, Hantek 6022BE/BL USB o simulador.
    2. Comparación .......... señales de entrada/salida, ganancia, fase y THD.
 
  Dependencias:
      pip install pyqt5 matplotlib numpy scipy pyvisa pyvisa-py
  (pyvisa-py es opcional si ya tiene NI-VISA / Keysight IO Libraries instalado.
   Para USB con pyvisa-py instale además: pip install pyusb)
- Para el Hantek 6022BE: pip install pyhantek (requiere Python 3.10 o posterior).
+ Para Hantek 6022BE/BL, consulte README.md (requiere Python 3.10 o posterior).
 
  Ejecución:
      python banco_pruebas_audio.py
@@ -23,6 +23,7 @@
 
 import csv
 import importlib
+import importlib.util
 import sys
 import threading
 import time
@@ -49,12 +50,12 @@ from matplotlib.backends.backend_qt5agg import (
 )
 from matplotlib.figure import Figure
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -154,9 +155,14 @@ class AnalizadorSenal:
         v_pp = float(np.max(v) - np.min(v))
         v_pico = float(np.max(np.abs(x)))
 
-        # Heurística de recorte (clipping): una senoide limpia tiene ~6 % de
-        # muestras a menos de 0.5 % de su pico; un "techo plano" supera el 10 %.
-        if v_pico > 0 and np.mean(np.abs(x) >= 0.995 * v_pico) > 0.10:
+        # Un techo plano puede ser clipping o una forma intencional (p. ej.,
+        # cuadrada). Exigir niveles intermedios evita marcar una cuadrada ideal.
+        cerca_del_pico = (np.mean(np.abs(x) >= 0.995 * v_pico)
+                          if v_pico > 0 else 0.0)
+        niveles_intermedios = (np.mean((np.abs(x) >= 0.10 * v_pico)
+                                       & (np.abs(x) <= 0.90 * v_pico))
+                               if v_pico > 0 else 0.0)
+        if cerca_del_pico > 0.10 and niveles_intermedios > 0.10:
             avisos.append("Posible recorte (clipping) del amplificador o de la "
                           "escala del osciloscopio: el THD no es fiable.")
 
@@ -208,30 +214,33 @@ class AnalizadorSenal:
         matriz = np.column_stack((base_sin, base_cos, np.ones(n)))
         coef = np.linalg.lstsq(matriz, v, rcond=None)[0]
         fase = float(np.arctan2(coef[1], coef[0]))
-
         ciclos = f1 * duracion
         if ciclos < 8:
-            avisos.append(f"Solo {ciclos:.1f} ciclos capturados: use ≥ 10 ciclos "
-                          "(base de tiempo más lenta) para un THD preciso.")
+            avisos.append(
+                f"Solo {ciclos:.1f} ciclos capturados: use ≥ 10 ciclos "
+                "(base de tiempos más lenta) para un THD preciso.")
 
         # ---- Armónicos 2..n_max y THD -------------------------------------
         armonicos: List[Armonico] = []
         for nh in range(2, n_max_armonico + 1):
             kh = int(round(nh * f1 / df))
             if kh + sa >= nb:
-                avisos.append(f"El armónico {nh} ({fmt_si(nh * f1, 'Hz')}) supera "
-                              f"Nyquist ({fmt_si(fs / 2, 'Hz')}): aumente la "
-                              "frecuencia de muestreo del osciloscopio.")
+                avisos.append(
+                    f"El armónico {nh} ({fmt_si(nh * f1, 'Hz')}) supera "
+                    f"Nyquist ({fmt_si(fs / 2, 'Hz')}): aumente la "
+                    "frecuencia de muestreo del osciloscopio.")
                 break
             lo_h, hi_h = max(kh - 2, 1), min(kh + 2, nb - 1)
             kp = lo_h + int(np.argmax(mag[lo_h:hi_h + 1]))
             vh = v_rms_tono(kp)
-            armonicos.append(Armonico(nh, nh * f1, vh,
-                                      20.0 * np.log10(max(vh, 1e-15) / v1)))
-
-        thd = (float(np.sqrt(sum(a_.v_rms ** 2 for a_ in armonicos)) / v1 * 100.0)
+            armonicos.append(Armonico(
+                nh, nh * f1, vh,
+                20.0 * np.log10(max(vh, 1e-15) / v1)))
+        thd = (float(np.sqrt(sum(a_.v_rms ** 2 for a_ in armonicos))
+                     / v1 * 100.0)
                if armonicos else float("nan"))
-        thdn = float(np.sqrt(max(v_rms_ac ** 2 - v1 ** 2, 0.0)) / v1 * 100.0)
+        thdn = float(
+            np.sqrt(max(v_rms_ac ** 2 - v1 ** 2, 0.0)) / v1 * 100.0)
 
         return ResultadoAnalisis(
             fs=fs, n_muestras=n, duracion=duracion, ciclos=ciclos, v_dc=v_dc,
@@ -245,6 +254,10 @@ class AnalizadorSenal:
 # =============================================================================
 #  INSTRUMENTOS (capa de abstracción)
 # =============================================================================
+class CapturaCancelada(Exception):
+    """Interrupción solicitada para una captura de larga duración."""
+
+
 class InstrumentoBase:
     """Interfaz común: el resto de la aplicación no sabe si es real o simulado."""
     def identificar(self) -> str:
@@ -306,10 +319,11 @@ class OsciloscopioVISA(InstrumentoBase):
             pass
 
 
-class OsciloscopioHantek6022BE(InstrumentoBase):
-    """Captura simultáneamente CH1 y CH2 del Hantek 6022BE por USB."""
+class OsciloscopioHantek6022B(InstrumentoBase):
+    """Captura simultáneamente CH1 y CH2 del Hantek 6022BE/BL por USB."""
 
     MUESTRAS = 10000
+    OPCIONES_MUESTRAS = (10_000, 50_000, 100_000, 250_000)
     MUESTRAS_INICIALES = 2048
     CODIGOS_CONTROL = {
         "ganancia_ch1": 0xE0,
@@ -320,13 +334,24 @@ class OsciloscopioHantek6022BE(InstrumentoBase):
         "frecuencia_calibracion": 0xE6,
     }
 
-    def __init__(self, encontrado, escalas, sondas):
+    def __init__(self, encontrado, escalas, sondas,
+                 sample_rate_hz=1e6, n_muestras=10_000,
+                 auto_escala=True, auto_tiempo=True):
         self.modelo = encontrado.model
+        if (isinstance(n_muestras, bool) or not isinstance(n_muestras, int)
+                or not 128 <= n_muestras <= 250_000):
+            raise ValueError("La captura Hantek debe tener entre 128 y 250000 muestras.")
+        if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+            raise ValueError("La frecuencia de muestreo debe ser positiva.")
+        self.n_muestras = n_muestras
+        self.sample_rate_hz = float(sample_rate_hz)
+        self.auto_escala = bool(auto_escala)
+        self.auto_tiempo = bool(auto_tiempo)
         scope_device = importlib.import_module("pyhantek.device").ScopeDevice
         self.dispositivo = scope_device(encontrado)
         try:
             self.calibracion = self._leer_calibracion()
-            self._configurar(escalas, sondas)
+            self._configurar(escalas, sondas, self.sample_rate_hz)
         except Exception:
             self.dispositivo.close()
             raise
@@ -340,7 +365,7 @@ class OsciloscopioHantek6022BE(InstrumentoBase):
             return None
         return np.frombuffer(datos[:80], dtype=np.uint8).reshape(5, 8, 2)
 
-    def _configurar(self, escalas, sondas):
+    def _configurar(self, escalas, sondas, sample_rate_hz):
         self.canales_cfg = []
         for canal, (escala, sonda) in enumerate(zip(escalas, sondas)):
             indice = self.modelo.gain_index_for(escala / sonda)
@@ -351,8 +376,11 @@ class OsciloscopioHantek6022BE(InstrumentoBase):
             self.canales_cfg.append((indice, sonda))
 
         self.indice_muestreo = next(
-            i for i, tasa in enumerate(self.modelo.sample_rates)
-            if tasa.rate == 1e6)
+            (i for i, tasa in enumerate(self.modelo.sample_rates)
+             if np.isclose(tasa.rate, sample_rate_hz)), None)
+        if self.indice_muestreo is None:
+            raise ValueError(
+                f"El Hantek no admite {fmt_si(sample_rate_hz, 'S/s')}.")
         self.tasa = self.modelo.sample_rates[self.indice_muestreo]
         self.dispositivo.control(
             self.CODIGOS_CONTROL["frecuencia_muestreo"],
@@ -377,27 +405,62 @@ class OsciloscopioHantek6022BE(InstrumentoBase):
         factor = 1.0 if g in (0, 255) else 1.0 + (g - 128) / 500.0
         return cero, factor
 
-    def capturar_varios(self, canales):
+    def ajustar_muestras_para_frecuencia(self, frecuencia_hz: float) -> int:
+        if (not self.auto_tiempo or not np.isfinite(frecuencia_hz)
+                or frecuencia_hz <= 0):
+            return self.n_muestras
+        necesarias = int(np.ceil(10.0 * self.tasa.rate / frecuencia_hz))
+        self.n_muestras = next(
+            (n for n in self.OPCIONES_MUESTRAS if n >= necesarias),
+            self.OPCIONES_MUESTRAS[-1])
+        return self.n_muestras
+
+    def _ajustar_escala(self, canal: int, voltios: np.ndarray) -> None:
+        if not self.auto_escala:
+            return
+        indice, sonda = self.canales_cfg[canal - 1]
+        pico = float(np.max(np.abs(voltios)))
+        if pico <= 0:
+            return
+        vdiv_objetivo = pico / (sonda * 3.0)
+        pasos = self.modelo.gain_steps
+        indice_nuevo = next(
+            (i for i, paso in enumerate(pasos)
+             if float(paso.vdiv) >= vdiv_objetivo),
+            len(pasos) - 1)
+        if indice_nuevo == indice:
+            return
+        paso = pasos[indice_nuevo]
+        self.dispositivo.control(
+            self.CODIGOS_CONTROL[f"ganancia_ch{canal}"],
+            bytes((paso.hw_gain, indice_nuevo)))
+        self.canales_cfg[canal - 1] = (indice_nuevo, sonda)
+
+    def capturar_varios(self, canales, cancelar=None):
         if not canales or any(canal not in (1, 2) for canal in canales):
-            raise ValueError("El Hantek 6022BE solo tiene CH1 y CH2.")
+            raise ValueError("El Hantek 6022B solo tiene CH1 y CH2.")
+        if cancelar is None:
+            cancelar = threading.Event()
         tasa = self.tasa
         muestras_por_canal = (
-            self.MUESTRAS * tasa.oversampling + self.MUESTRAS_INICIALES)
+            self.n_muestras * tasa.oversampling + self.MUESTRAS_INICIALES)
         muestras_por_canal = ((muestras_por_canal + 511) // 512) * 512
-        omitir = muestras_por_canal - self.MUESTRAS * tasa.oversampling
+        omitir = muestras_por_canal - self.n_muestras * tasa.oversampling
         total_bytes = muestras_por_canal * 2
         try:
             datos = self.dispositivo.read(
                 total_bytes,
                 tasa.rate * tasa.oversampling * 2,
-                threading.Event())
+                cancelar)
         finally:
             self.dispositivo.stop_sampling()
+        if cancelar.is_set():
+            raise CapturaCancelada()
         if datos is None or len(datos) != total_bytes:
             raise RuntimeError("El Hantek no entregó una captura completa.")
 
         intercalados = np.asarray(datos, dtype=np.uint8).reshape(-1, 2)
-        tiempo = np.arange(self.MUESTRAS, dtype=float) / tasa.rate
+        tiempo = np.arange(self.n_muestras, dtype=float) / tasa.rate
         resultado = {}
         for canal in set(canales):
             indice, sonda = self.canales_cfg[canal - 1]
@@ -408,6 +471,7 @@ class OsciloscopioHantek6022BE(InstrumentoBase):
             voltios = ((muestras - cero) * factor
                        * sonda / self.modelo.voltage_scale[indice])
             resultado[canal] = (tiempo.copy(), voltios)
+            self._ajustar_escala(canal, voltios)
         return resultado
 
     def cerrar(self):
@@ -507,15 +571,23 @@ class HiloCaptura(QThread):
         self.continuo = continuo
         self.periodo_ms = periodo_ms
         self._activo = True
+        self._cancelar = threading.Event()
 
     def detener(self):
         self._activo = False
+        self._cancelar.set()
 
     def run(self):
         while self._activo:
             t0 = time.monotonic()
             try:
-                resultado = self.instrumento.capturar_varios(self.canales)
+                if isinstance(self.instrumento, OsciloscopioHantek6022B):
+                    resultado = self.instrumento.capturar_varios(
+                        self.canales, self._cancelar)
+                else:
+                    resultado = self.instrumento.capturar_varios(self.canales)
+            except CapturaCancelada:
+                return
             except Exception as e:                      # noqa: BLE001
                 self.error.emit(f"{type(e).__name__}: {e}")
                 return
@@ -561,11 +633,18 @@ class PanelConexion(QGroupBox):
         self._sim = OsciloscopioSimulado()
         self._tarea: Optional[TareaAsync] = None
         self._hantek_encontrados = {}
+        self._auto_deteccion_habilitada = True
+        self._auto_deteccion_iniciada = False
+        self._timer_autodeteccion = QTimer(self)
+        self._timer_autodeteccion.setInterval(5000)
+        self._timer_autodeteccion.timeout.connect(
+            self._escanear_hantek_automaticamente)
 
         self.chk_demo = QCheckBox("Modo Simulador / Demo")
         self.cmb_tipo = QComboBox()
         self.cmb_tipo.addItem("VISA / SCPI", "visa")
-        self.cmb_tipo.addItem("Hantek 6022BE (USB)", "hantek")
+        self.cmb_tipo.addItem("Hantek 6022BE/BL (USB)", "hantek")
+        self.cmb_tipo.setCurrentIndex(1)
         self.cmb_recursos = QComboBox()
         self.cmb_recursos.setEditable(True)
         self.cmb_recursos.setMinimumWidth(320)
@@ -586,21 +665,49 @@ class PanelConexion(QGroupBox):
         self.lbl_idn = QLabel("Sin conexión")
         self.lbl_idn.setStyleSheet("font-weight: bold;")
 
-        self.grp_hantek = QGroupBox("Ajustes del Hantek (por división)")
-        h = QHBoxLayout(self.grp_hantek)
+        self.grp_hantek = QGroupBox("Ajustes del Hantek")
+        h = QGridLayout(self.grp_hantek)
         self.cmb_escala_ch1 = self._combo_escalas()
         self.cmb_escala_ch1.setCurrentIndex(7)
         self.cmb_escala_ch2 = self._combo_escalas()
         self.cmb_escala_ch2.setCurrentIndex(4)
         self.cmb_sonda_ch1 = self._combo_sondas()
         self.cmb_sonda_ch2 = self._combo_sondas()
-        for etiqueta, control in (
+        for columna, (etiqueta, control) in enumerate((
                 ("CH1 salida:", self.cmb_escala_ch1),
                 ("Sonda:", self.cmb_sonda_ch1),
                 ("CH2 entrada:", self.cmb_escala_ch2),
-                ("Sonda:", self.cmb_sonda_ch2)):
-            h.addWidget(QLabel(etiqueta))
-            h.addWidget(control)
+                ("Sonda:", self.cmb_sonda_ch2))):
+            h.addWidget(QLabel(etiqueta), 0, columna * 2)
+            h.addWidget(control, 0, columna * 2 + 1)
+        self.cmb_tasa_hantek = QComboBox()
+        self.cmb_tasa_hantek.addItem("500 kS/s", 500_000.0)
+        self.cmb_tasa_hantek.setToolTip(
+            "Elija una frecuencia suficiente para la señal. El límite útil "
+            "es inferior a la mitad de esta tasa.")
+        self.cmb_muestras_hantek = QComboBox()
+        for muestras in (10_000, 50_000, 100_000, 250_000):
+            self.cmb_muestras_hantek.addItem(
+                f"{muestras:,}".replace(",", " "), muestras)
+        self.cmb_muestras_hantek.setCurrentIndex(3)
+        self.cmb_muestras_hantek.setToolTip(
+            "Más muestras amplían la duración y mejoran la resolución de "
+            "frecuencia, pero tardan más en transferirse.")
+        self.chk_auto_escala_hantek = QCheckBox("Autoescala vertical")
+        self.chk_auto_escala_hantek.setChecked(True)
+        self.chk_auto_escala_hantek.setToolTip(
+            "Ajusta automáticamente la escala física de cada canal después "
+            "de cada captura.")
+        self.chk_auto_tiempo_hantek = QCheckBox("Auto tiempo (10 ciclos)")
+        self.chk_auto_tiempo_hantek.setChecked(True)
+        self.chk_auto_tiempo_hantek.setToolTip(
+            "Adapta el registro entre capturas para incluir unos diez ciclos.")
+        h.addWidget(QLabel("Muestreo:"), 1, 0)
+        h.addWidget(self.cmb_tasa_hantek, 1, 1, 1, 2)
+        h.addWidget(QLabel("Muestras:"), 1, 3)
+        h.addWidget(self.cmb_muestras_hantek, 1, 4, 1, 2)
+        h.addWidget(self.chk_auto_escala_hantek, 2, 0, 1, 3)
+        h.addWidget(self.chk_auto_tiempo_hantek, 2, 3, 1, 3)
         self.grp_hantek.setVisible(False)
 
         g = QGridLayout(self)
@@ -623,7 +730,7 @@ class PanelConexion(QGroupBox):
         self.chk_demo.toggled.connect(self._cambio_demo)
 
         self._cambio_tipo()
-        if not VISA_DISPONIBLE:
+        if not VISA_DISPONIBLE and not self.es_hantek():
             self.lbl_idn.setText("PyVISA no instalado (pip install pyvisa pyvisa-py). "
                                  "Use el modo Simulador.")
 
@@ -687,7 +794,10 @@ class PanelConexion(QGroupBox):
             disponible and desconectado and not self.es_hantek())
         self.grp_hantek.setVisible(self.es_hantek() and not self.es_demo())
         for w in (self.cmb_escala_ch1, self.cmb_escala_ch2,
-                  self.cmb_sonda_ch1, self.cmb_sonda_ch2):
+                  self.cmb_sonda_ch1, self.cmb_sonda_ch2,
+                  self.cmb_tasa_hantek, self.cmb_muestras_hantek,
+                  self.chk_auto_escala_hantek,
+                  self.chk_auto_tiempo_hantek):
             w.setEnabled(disponible and desconectado and self.es_hantek())
 
     def _lanzar(self, funcion, ok, fallo):
@@ -710,7 +820,7 @@ class PanelConexion(QGroupBox):
 
     def _escanear(self):
         if self.es_hantek():
-            self.mensaje.emit("Buscando Hantek 6022BE por USB…")
+            self.mensaje.emit("Buscando Hantek 6022BE/BL por USB…")
             self._lanzar(self._buscar_hantek, self._escaneo_hantek_ok,
                          lambda m: self._error("Error al buscar Hantek", m))
             return
@@ -719,6 +829,43 @@ class PanelConexion(QGroupBox):
                      self._escaneo_ok,
                      lambda m: self._error("Error al escanear", m))
 
+    def iniciar_deteccion_automatica(self):
+        if importlib.util.find_spec("pyhantek") is None:
+            self._auto_deteccion_habilitada = False
+            self.mensaje.emit(
+                "Autodetección Hantek deshabilitada: falta instalar pyhantek.")
+            return
+        self._auto_deteccion_iniciada = True
+        if self.es_hantek() and self._auto_deteccion_habilitada:
+            self.mensaje.emit("Buscando y conectando el Hantek automáticamente…")
+            self._timer_autodeteccion.start()
+            QTimer.singleShot(0, self._escanear_hantek_automaticamente)
+
+    def _escanear_hantek_automaticamente(self):
+        if (not self._auto_deteccion_habilitada or not self.es_hantek()
+                or self.es_demo() or self._instrumento is not None
+                or (self._tarea is not None and self._tarea.isRunning())):
+            return
+        self._lanzar(
+            self._buscar_hantek,
+            self._escaneo_hantek_automatico_ok,
+            self._error_autodeteccion)
+
+    def _escaneo_hantek_automatico_ok(self, encontrados):
+        self._escaneo_hantek_ok(encontrados, automatico=True)
+        if len(encontrados) == 1:
+            self._timer_autodeteccion.stop()
+            QTimer.singleShot(0, lambda: self._conectar(automatico=True))
+        elif len(encontrados) > 1:
+            self._timer_autodeteccion.stop()
+            self.mensaje.emit(
+                "Hay varios Hantek; seleccione uno y pulse Conectar.")
+
+    def _error_autodeteccion(self, detalle: str):
+        self._timer_autodeteccion.stop()
+        self._auto_deteccion_habilitada = False
+        self._error("Autoconexión Hantek fallida", detalle)
+
     @staticmethod
     def _buscar_hantek():
         try:
@@ -726,19 +873,30 @@ class PanelConexion(QGroupBox):
                 "pyhantek.device").find_devices
         except ImportError as e:
             raise RuntimeError(
-                "Falta el controlador Python del Hantek. Instálelo con "
-                "'pip install pyhantek'.") from e
+                "Falta el soporte USB del Hantek. Siga las instrucciones de "
+                "instalación para Windows en README.md.") from e
         return [d for d in find_devices()
-                if d.model.name == "DSO-6022BE"]
+                if d.model.name in ("DSO-6022BE", "DSO-6022BL")]
 
-    def _escaneo_hantek_ok(self, encontrados):
+    def _escaneo_hantek_ok(self, encontrados, automatico=False):
         self._hantek_encontrados = {d.label: d for d in encontrados}
         self.cmb_recursos.clear()
         self.cmb_recursos.addItems(list(self._hantek_encontrados))
         if encontrados:
-            self.mensaje.emit(
-                f"{len(encontrados)} Hantek 6022BE encontrado(s).")
-        else:
+            tasa_actual = self.cmb_tasa_hantek.currentData()
+            self.cmb_tasa_hantek.clear()
+            for tasa in encontrados[0].model.sample_rates:
+                if tasa.rate >= 100_000:
+                    self.cmb_tasa_hantek.addItem(
+                        fmt_si(tasa.rate, "S/s"), float(tasa.rate))
+            indice = self.cmb_tasa_hantek.findData(tasa_actual)
+            if indice < 0:
+                indice = self.cmb_tasa_hantek.findData(500_000.0)
+            self.cmb_tasa_hantek.setCurrentIndex(max(indice, 0))
+            if not automatico:
+                self.mensaje.emit(
+                    f"{len(encontrados)} Hantek 6022BE/BL encontrado(s).")
+        elif not automatico:
             self.mensaje.emit(
                 "No se encontró el Hantek. Revise USB y el controlador WinUSB.")
 
@@ -754,21 +912,26 @@ class PanelConexion(QGroupBox):
             self.mensaje.emit("No se encontraron recursos. Puede escribir la "
                               "dirección a mano (p. ej. TCPIP0::IP::INSTR).")
 
-    def _conectar(self):
+    def _conectar(self, automatico=False):
         if self.es_hantek():
             encontrado = self._hantek_encontrados.get(
                 self.cmb_recursos.currentText())
             if encontrado is None:
                 QMessageBox.information(
                     self, "Conexión",
-                    "Pulse Escanear y seleccione el Hantek 6022BE.")
+                    "Pulse Escanear y seleccione el Hantek 6022BE/BL.")
                 return
             escalas = (self.cmb_escala_ch1.currentData(),
                        self.cmb_escala_ch2.currentData())
             sondas = (self.cmb_sonda_ch1.currentData(),
                       self.cmb_sonda_ch2.currentData())
+            sample_rate_hz = self.cmb_tasa_hantek.currentData()
+            n_muestras = self.cmb_muestras_hantek.currentData()
+            auto_escala = self.chk_auto_escala_hantek.isChecked()
+            auto_tiempo = self.chk_auto_tiempo_hantek.isChecked()
+            self._timer_autodeteccion.stop()
             self._cerrar_instrumento()
-            self.mensaje.emit("Conectando al Hantek 6022BE…")
+            self.mensaje.emit("Conectando al Hantek 6022BE/BL…")
 
             def tarea_hantek():
                 upload_firmware = importlib.import_module(
@@ -777,12 +940,14 @@ class PanelConexion(QGroupBox):
                     encontrado_actualizado = upload_firmware(encontrado)
                 else:
                     encontrado_actualizado = encontrado
-                osc = OsciloscopioHantek6022BE(
-                    encontrado_actualizado, escalas, sondas)
+                osc = OsciloscopioHantek6022B(
+                    encontrado_actualizado, escalas, sondas,
+                    sample_rate_hz, n_muestras, auto_escala, auto_tiempo)
                 return osc, osc.identificar()
 
             self._lanzar(tarea_hantek, self._conexion_ok,
-                         lambda m: self._error("No se pudo conectar", m))
+                         (self._error_autodeteccion if automatico else
+                          lambda m: self._error("No se pudo conectar", m)))
             return
 
         recurso = self.cmb_recursos.currentText().strip()
@@ -805,12 +970,16 @@ class PanelConexion(QGroupBox):
 
     def _conexion_ok(self, resultado):
         self._instrumento, idn = resultado
+        self._timer_autodeteccion.stop()
+        self._auto_deteccion_habilitada = False
         self.lbl_idn.setText(idn)
         self._set_ocupado(False)
         self.mensaje.emit("Conexión establecida.")
         self.conexion_cambiada.emit(True)
 
     def _desconectar(self):
+        self._timer_autodeteccion.stop()
+        self._auto_deteccion_habilitada = False
         self._cerrar_instrumento()
         self.lbl_idn.setText("Sin conexión")
         self._set_ocupado(False)
@@ -824,6 +993,11 @@ class PanelConexion(QGroupBox):
 
     def _cambio_demo(self, activo: bool):
         if activo:
+            self._timer_autodeteccion.stop()
+        elif (self._auto_deteccion_iniciada
+              and self._auto_deteccion_habilitada and self.es_hantek()):
+            self._timer_autodeteccion.start()
+        if activo:
             self.lbl_idn.setText("MODO DEMO — " + self._sim.identificar())
             self.conexion_cambiada.emit(True)
         else:
@@ -836,7 +1010,7 @@ class PanelConexion(QGroupBox):
         if self.es_hantek():
             self.cmb_recursos.setEditable(False)
             self.cmb_recursos.setToolTip(
-                "Seleccione el Hantek 6022BE encontrado al escanear.")
+                "Seleccione el Hantek 6022BE/BL encontrado al escanear.")
         else:
             self.cmb_recursos.setEditable(True)
             self.cmb_recursos.setToolTip(
@@ -844,19 +1018,46 @@ class PanelConexion(QGroupBox):
         self.cmb_recursos.clear()
         self._hantek_encontrados.clear()
         self._set_ocupado(False)
+        if not self.es_hantek() and not VISA_DISPONIBLE:
+            self.lbl_idn.setText(
+                "PyVISA no instalado (pip install pyvisa pyvisa-py). "
+                "Use el modo Simulador.")
+        if self.es_hantek() and self._auto_deteccion_iniciada:
+            if self._auto_deteccion_habilitada:
+                self._timer_autodeteccion.start()
+        else:
+            self._timer_autodeteccion.stop()
 
     def _error(self, titulo: str, detalle: str):
         self.mensaje.emit(titulo)
         QMessageBox.warning(self, titulo, detalle)
 
     def cerrar(self):
+        self._timer_autodeteccion.stop()
         self._cerrar_instrumento()
+
+    def actualizar_ajustes_hantek(self, instrumento):
+        for canal, combo in ((1, self.cmb_escala_ch1),
+                             (2, self.cmb_escala_ch2)):
+            indice, sonda = instrumento.canales_cfg[canal - 1]
+            vdiv = instrumento.modelo.gain_steps[indice].vdiv * sonda
+            seleccionado = next(
+                (i for i in range(combo.count())
+                 if np.isclose(combo.itemData(i), vdiv)), -1)
+            if seleccionado >= 0:
+                combo.setCurrentIndex(seleccionado)
+        muestras_idx = self.cmb_muestras_hantek.findData(
+            instrumento.n_muestras)
+        if muestras_idx >= 0:
+            self.cmb_muestras_hantek.setCurrentIndex(muestras_idx)
 
 
 # =============================================================================
 #  PESTAÑA 2: ADQUISICIÓN Y MÉTRICAS
 # =============================================================================
 class PestanaMedicion(QWidget):
+    MAX_PUNTOS_GRAFICA = 3000
+
     def __init__(self, conexion: PanelConexion, parent=None):
         super().__init__(parent)
         self.conexion = conexion
@@ -871,6 +1072,7 @@ class PestanaMedicion(QWidget):
         self._xmax_prev = None
         self._construir_ui()
         self.conexion.chk_demo.toggled.connect(self.grp_sim.setVisible)
+        self.conexion.conexion_cambiada.connect(self._cambiar_captura_automatica)
         self.grp_sim.setVisible(self.conexion.es_demo())
 
     # ---- Construcción de la interfaz --------------------------------------
@@ -907,9 +1109,8 @@ class PestanaMedicion(QWidget):
         self.cmb_salida.setToolTip("Canal conectado a la salida del amplificador.")
         self.chk_auto = QCheckBox("Auto-detectar fundamental")
         self.chk_auto.setChecked(True)
-        self.spn_f1 = self._spin(1, 1e6, 1000.0, 1, " Hz", 100)
+        self.spn_f1 = self._spin(1, 15e6, 1000.0, 1, " Hz", 100)
         self.spn_f1.setEnabled(False)
-        self.chk_auto.toggled.connect(lambda a: self.spn_f1.setEnabled(not a))
 
         grp = QGroupBox("2. Señales a comparar")
         f = QFormLayout(grp)
@@ -965,11 +1166,15 @@ class PestanaMedicion(QWidget):
         w_izq.setMaximumWidth(420)
 
         # --- Gráficas
-        self.lienzo = LienzoMpl()
-        fig = self.lienzo.fig
-        self.ax_t = fig.add_subplot(2, 1, 1)
-        self.ax_f = fig.add_subplot(2, 1, 2)
+        self.lienzo_tiempo = LienzoMpl(figsize=(10, 6))
+        self.lienzo_espectro = LienzoMpl(figsize=(10, 6))
+        self.ax_t = self.lienzo_tiempo.fig.add_subplot(1, 1, 1)
+        self.ax_f = self.lienzo_espectro.fig.add_subplot(1, 1, 1)
         self.ax_t_in = self.ax_t.twinx()
+        self.tabs_graficas = QTabWidget()
+        self.tabs_graficas.addTab(self.lienzo_tiempo, "Forma de onda")
+        self.tabs_graficas.addTab(self.lienzo_espectro, "Espectro")
+        self.tabs_graficas.currentChanged.connect(self._redibujar_grafica_activa)
         self.ln_t, = self.ax_t.plot(
             [], [], lw=1.1, color="tab:blue", label="Salida")
         self.ln_t_in, = self.ax_t_in.plot(
@@ -988,16 +1193,16 @@ class PestanaMedicion(QWidget):
             [], [], "ro", ms=5, label="Armónicos de salida")
         self.ax_f.set_title("Espectro comparado")
         self.ax_f.set_xlabel("Frecuencia [Hz]")
-        self.ax_f.set_ylabel("Nivel [dBV rms]")
+        self.ax_f.set_ylabel("Nivel por bin [dBV rms]")
         self.ax_f.grid(True, alpha=0.4)
         self.ax_f.legend(loc="upper right")
 
         # --- Resultados
         mono = "font-family: monospace; font-weight: bold;"
         filas_resumen = [("gain", "Ganancia fundamental (salida / entrada)"),
-                         ("df", "Diferencia de frecuencia"),
+                         ("df", "Diferencia de frecuencia fundamental"),
                          ("phase", "Desfase de salida respecto a entrada"),
-                         ("delta_thd", "Cambio de distorsión (salida − entrada)")]
+                         ("delta_thd", "Cambio de THD H2–H5")]
         filas_detalle = [("vpp", "Tensión pico a pico"),
                          ("vpk", "Tensión de pico (sin DC)"),
                          ("vdc", "Offset DC"),
@@ -1012,6 +1217,7 @@ class PestanaMedicion(QWidget):
         grp_res = QGroupBox("Resultados")
         tabs_res = QTabWidget()
         self.lbl = {}
+        self.titulos = {}
         for nombre, filas in (("Resumen", filas_resumen),
                               ("Detalles", filas_detalle)):
             pagina = QWidget()
@@ -1020,7 +1226,9 @@ class PestanaMedicion(QWidget):
                 lb = QLabel("—")
                 lb.setStyleSheet(mono)
                 self.lbl[clave] = lb
-                form.addRow(texto + ":", lb)
+                titulo = QLabel(texto + ":")
+                self.titulos[clave] = titulo
+                form.addRow(titulo, lb)
             tabs_res.addTab(pagina, nombre)
         res_layout = QVBoxLayout(grp_res)
         res_layout.addWidget(tabs_res)
@@ -1040,9 +1248,6 @@ class PestanaMedicion(QWidget):
         self.tabla = QTableWidget(2, 4)
         self.tabla.setHorizontalHeaderLabels(
             ["Señal", "Fundamental [Hz]", "Vrms AC", "THD H2–H5"])
-        self.tabla.setToolTip(
-            "Comparación directa de frecuencia, tensión eficaz y distorsión "
-            "de entrada y salida.")
         self.tabla.verticalHeader().setVisible(False)
         self.tabla.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1062,12 +1267,18 @@ class PestanaMedicion(QWidget):
         inferior.addLayout(col_tab, 1)
         w_inf = QWidget()
         w_inf.setLayout(inferior)
+        w_inf.setMinimumHeight(0)
+        scroll_resultados = QScrollArea()
+        scroll_resultados.setWidgetResizable(True)
+        scroll_resultados.setMinimumHeight(140)
+        scroll_resultados.setWidget(w_inf)
 
         der = QSplitter(Qt.Vertical)
-        der.addWidget(self.lienzo)
-        der.addWidget(w_inf)
+        der.addWidget(self.tabs_graficas)
+        der.addWidget(scroll_resultados)
         der.setStretchFactor(0, 3)
         der.setStretchFactor(1, 1)
+        der.setSizes([600, 180])
 
         raiz = QHBoxLayout(self)
         raiz.addWidget(w_izq)
@@ -1077,7 +1288,18 @@ class PestanaMedicion(QWidget):
         for s in (self.spn_rl, self.spn_vcc, self.spn_idc, self.spn_f1):
             s.valueChanged.connect(self._reanalizar)
         self.cmb_alim.currentIndexChanged.connect(self._reanalizar)
-        self.chk_auto.toggled.connect(self._reanalizar)
+        self.chk_auto.toggled.connect(self._cambiar_auto_fundamental)
+        self.conexion.cmb_tasa_hantek.currentIndexChanged.connect(
+            self._limitar_frecuencia_fundamental)
+
+    def _cambiar_auto_fundamental(self, automatico: bool):
+        self.spn_f1.setEnabled(not automatico)
+        self._reanalizar()
+
+    def _limitar_frecuencia_fundamental(self, *_):
+        if self.conexion.es_hantek():
+            tasa = self.conexion.cmb_tasa_hantek.currentData() or 1e6
+            self.spn_f1.setMaximum(max(1.0, float(tasa) / 2.0))
 
     # ---- Captura -----------------------------------------------------------
     def _aplicar_params_sim(self):
@@ -1093,6 +1315,12 @@ class PestanaMedicion(QWidget):
                 self.btn_continuo.setChecked(False)
         elif self._hilo is not None:
             self._hilo.detener()
+
+    def _cambiar_captura_automatica(self, conectado: bool):
+        if conectado and not self.btn_continuo.isChecked():
+            self.btn_continuo.setChecked(True)
+        elif not conectado and self.btn_continuo.isChecked():
+            self.btn_continuo.setChecked(False)
 
     def _iniciar_captura(self, continuo: bool) -> bool:
         inst = self.conexion.instrumento()
@@ -1121,7 +1349,7 @@ class PestanaMedicion(QWidget):
         elif self._canal_entrada > 2 or self._canal_salida > 2:
             QMessageBox.warning(
                 self, "Canales no disponibles",
-                "El Hantek 6022BE solo dispone de CH1 y CH2.")
+                "El Hantek 6022BE/BL solo dispone de CH1 y CH2.")
             return False
         canales = (self._canal_entrada, self._canal_salida)
         self._hilo = HiloCaptura(inst, canales, continuo,
@@ -1143,6 +1371,12 @@ class PestanaMedicion(QWidget):
         if self.conexion.es_demo() and self._hilo and self._hilo.continuo:
             self._aplicar_params_sim()      # permite mover los controles "en vivo"
         self._reanalizar()
+        instrumento = self.conexion.instrumento()
+        if (isinstance(instrumento, OsciloscopioHantek6022B)
+                and self._res is not None and self._res_entrada is not None):
+            frecuencia_minima = min(self._res.f1, self._res_entrada.f1)
+            instrumento.ajustar_muestras_para_frecuencia(frecuencia_minima)
+            self.conexion.actualizar_ajustes_hantek(instrumento)
 
     def _on_error(self, msg: str):
         self.btn_continuo.setChecked(False)
@@ -1170,12 +1404,14 @@ class PestanaMedicion(QWidget):
             return
         f_esp = None if self.chk_auto.isChecked() else self.spn_f1.value()
         try:
-            self._res = AnalizadorSenal.analizar(self._t, self._v, f_esperada=f_esp)
+            self._res = AnalizadorSenal.analizar(
+                self._t, self._v, f_esperada=f_esp)
             self._res_entrada = AnalizadorSenal.analizar(
                 self._t_entrada, self._v_entrada, f_esperada=f_esp)
             avisos = ([f"Entrada: {av}" for av in self._res_entrada.avisos]
                       + [f"Salida: {av}" for av in self._res.avisos])
-            if abs(self._res.f1 - self._res_entrada.f1) / self._res_entrada.f1 > 0.01:
+            if (abs(self._res.f1 - self._res_entrada.f1)
+                    / self._res_entrada.f1 > 0.01):
                 avisos.append(
                     "Las frecuencias difieren más de 1 %; compare el desfase con cuidado.")
             self.lbl_aviso.setText("  ".join(avisos))
@@ -1186,22 +1422,155 @@ class PestanaMedicion(QWidget):
         self._pintar()
         self._actualizar_metricas()
 
+    @staticmethod
+    def _buscar_disparo(t, v, resultado):
+        if (resultado is None or not np.isfinite(resultado.f1)
+                or resultado.f1 <= 0 or not np.isfinite(resultado.v_pico)
+                or resultado.v_pico <= 0):
+            return None
+        nivel = resultado.v_dc + 0.05 * resultado.v_pico
+        arriba = v >= nivel
+        indices = np.flatnonzero(~arriba[:-1] & arriba[1:])
+        if indices.size < 3:
+            return None
+        fracciones = ((nivel - v[indices])
+                      / (v[indices + 1] - v[indices]))
+        cruces = t[indices] + fracciones * (t[indices + 1] - t[indices])
+        periodo = 1.0 / resultado.f1
+        intervalos = np.diff(cruces)
+        periodicos = np.abs(intervalos / periodo - 1.0) <= 0.25
+        candidatos = np.flatnonzero(periodicos[:-1] & periodicos[1:])
+        if not candidatos.size:
+            return None
+        return float(cruces[candidatos[0]])
+
+    @staticmethod
+    def _agregar_punto_disparo(tiempo_grafica, valores_grafica, t, v,
+                               disparo):
+        if (disparo is None or not tiempo_grafica.size
+                or tiempo_grafica[0] <= 0 or disparo < t[0]
+                or disparo > t[-1]):
+            return tiempo_grafica, valores_grafica
+        valor_disparo = np.interp(disparo, t, v)
+        return (np.concatenate(([0.0], tiempo_grafica)),
+                np.concatenate(([valor_disparo], valores_grafica)))
+
+    @staticmethod
+    def _decimar_serie(x, y, max_puntos=MAX_PUNTOS_GRAFICA):
+        if y.size <= max_puntos:
+            return x, y
+        n_por_bloque = max(1, max_puntos // 4)
+        tam_bloque = (y.size + n_por_bloque - 1) // n_por_bloque
+        inicios = np.arange(0, y.size, tam_bloque)
+        n_relleno = inicios.size * tam_bloque - y.size
+        valores_min = np.pad(
+            y, (0, n_relleno), constant_values=np.inf
+        ).reshape(-1, tam_bloque)
+        valores_max = np.pad(
+            y, (0, n_relleno), constant_values=-np.inf
+        ).reshape(-1, tam_bloque)
+        finales = np.minimum(inicios + tam_bloque, y.size) - 1
+        indices = np.concatenate((
+            inicios,
+            inicios + valores_min.argmin(axis=1),
+            inicios + valores_max.argmax(axis=1),
+            finales,
+        ))
+        indices.sort()
+        return x[indices], y[indices]
+
+    @staticmethod
+    def _decimar_espectro(freqs, espectro_dbv,
+                         max_puntos=MAX_PUNTOS_GRAFICA):
+        if espectro_dbv.size <= max_puntos:
+            return freqs, espectro_dbv
+        tam_bloque = (
+            espectro_dbv.size + max_puntos - 1) // max_puntos
+        inicios = np.arange(0, espectro_dbv.size, tam_bloque)
+        n_relleno = inicios.size * tam_bloque - espectro_dbv.size
+        bloques = np.pad(
+            espectro_dbv, (0, n_relleno), constant_values=-np.inf
+        ).reshape(-1, tam_bloque)
+        indices = inicios + bloques.argmax(axis=1)
+        return freqs[indices], espectro_dbv[indices]
+
+    def _redibujar_grafica_activa(self, *_):
+        lienzo = (self.lienzo_tiempo if self.tabs_graficas.currentIndex() == 0
+                  else self.lienzo_espectro)
+        lienzo.redibujar()
+
     def _pintar(self):
-        self.ln_t.set_data((self._t - self._t[0]) * 1e3, self._v)
-        self.ln_t_in.set_data(
-            (self._t_entrada - self._t_entrada[0]) * 1e3, self._v_entrada)
+        r = self._res
+        r_entrada = self._res_entrada
+        disparo = None
+        resultado_referencia = None
+        nombre_referencia = ""
+        referencias = (
+            (self._t_entrada, self._v_entrada, r_entrada,
+             f"entrada {self.cmb_entrada.currentText()}"),
+            (self._t, self._v, r,
+             f"salida {self.cmb_salida.currentText()}"),
+        )
+        for t_ref, v_ref, analisis_ref, nombre in referencias:
+            disparo = self._buscar_disparo(t_ref, v_ref, analisis_ref)
+            if disparo is not None:
+                resultado_referencia = analisis_ref
+                nombre_referencia = nombre
+                break
+
+        inicio = (disparo if disparo is not None
+                  else min(float(self._t[0]), float(self._t_entrada[0])))
+        tiempo = (self._t - inicio) * 1e3
+        tiempo_entrada = (self._t_entrada - inicio) * 1e3
+        resultado_ventana = (
+            resultado_referencia if resultado_referencia is not None
+            else r if r is not None else r_entrada)
+        duracion = max(
+            0.0, min(float(self._t[-1]), float(self._t_entrada[-1])) - inicio)
+        limite_ms = duracion * 1e3
+        if resultado_ventana is not None and resultado_ventana.f1 > 0:
+            limite_ms = min(limite_ms, 3.0 / resultado_ventana.f1 * 1e3)
+
+        inicio_muestras = np.searchsorted(tiempo, 0.0, side="left")
+        fin = np.searchsorted(tiempo, limite_ms, side="right")
+        inicio_entrada = np.searchsorted(
+            tiempo_entrada, 0.0, side="left")
+        fin_entrada = np.searchsorted(
+            tiempo_entrada, limite_ms, side="right")
+        tiempo_salida, valores_salida = self._agregar_punto_disparo(
+            tiempo[inicio_muestras:fin], self._v[inicio_muestras:fin],
+            self._t, self._v, disparo)
+        tiempo_entrada_plot, valores_entrada_plot = self._agregar_punto_disparo(
+            tiempo_entrada[inicio_entrada:fin_entrada],
+            self._v_entrada[inicio_entrada:fin_entrada],
+            self._t_entrada, self._v_entrada, disparo)
+        self.ln_t.set_data(*self._decimar_serie(
+            tiempo_salida, valores_salida))
+        self.ln_t_in.set_data(*self._decimar_serie(
+            tiempo_entrada_plot, valores_entrada_plot))
         self.ax_t.relim()
         self.ax_t.autoscale_view()
         self.ax_t_in.relim()
         self.ax_t_in.autoscale_view()
+        if limite_ms > 0:
+            self.ax_t.set_xlim(0, limite_ms)
+        self.ax_t.set_title(
+            "Comparación en el tiempo — "
+            + (f"sincronizada con {nombre_referencia}"
+               if disparo is not None else "barrido libre"))
         for a in self._anotaciones:
             a.remove()
         self._anotaciones.clear()
-        r = self._res
-        r_entrada = self._res_entrada
         if r is not None and r_entrada is not None:
-            self.ln_f_in.set_data(r_entrada.freqs, r_entrada.espectro_dbv)
-            self.ln_f.set_data(r.freqs, r.espectro_dbv)
+            xmax = min(r.fs / 2, max(8 * r.f1, 1.0))
+            fin_entrada = np.searchsorted(
+                r_entrada.freqs, xmax, side="right")
+            fin = np.searchsorted(r.freqs, xmax, side="right")
+            self.ln_f_in.set_data(*self._decimar_espectro(
+                r_entrada.freqs[:fin_entrada],
+                r_entrada.espectro_dbv[:fin_entrada]))
+            self.ln_f.set_data(*self._decimar_espectro(
+                r.freqs[:fin], r.espectro_dbv[:fin]))
             comps = [Armonico(1, r.f1, r.v1_rms, 0.0)] + r.armonicos
             xs = [c.f for c in comps]
             ys = [20 * np.log10(max(c.v_rms, 1e-12)) for c in comps]
@@ -1210,17 +1579,16 @@ class PestanaMedicion(QWidget):
                 self._anotaciones.append(self.ax_f.annotate(
                     f"H{c.n}", (c.f, y), textcoords="offset points",
                     xytext=(0, 6), ha="center", fontsize=8))
-            xmax = min(r.fs / 2, max(8 * r.f1, 1.0))
+            techo = max(ys)
             if self._xmax_prev is None or abs(xmax - self._xmax_prev) > 0.1 * xmax:
                 self.ax_f.set_xlim(0, xmax)
                 self._xmax_prev = xmax
-            techo = ys[0]
             self.ax_f.set_ylim(techo - 110, techo + 10)
         else:
             self.ln_f_in.set_data([], [])
             self.ln_f.set_data([], [])
             self.ln_h.set_data([], [])
-        self.lienzo.redibujar()
+        self._redibujar_grafica_activa()
 
     def _actualizar_metricas(self):
         L = self.lbl
@@ -1232,14 +1600,21 @@ class PestanaMedicion(QWidget):
             self.tabla.clearContents()
             return
         rl, vcc, idc = self.spn_rl.value(), self.spn_vcc.value(), self.spn_idc.value()
-        ganancia = r.v1_rms / r_entrada.v1_rms
-        ganancia_db = 20.0 * np.log10(ganancia)
-        delta_f = r.f1 - r_entrada.f1
-        delta_f_pct = abs(delta_f) / r_entrada.f1
-        desfase = (r.fase_fundamental - r_entrada.fase_fundamental + np.pi) % (
-            2.0 * np.pi) - np.pi
-        L["gain"].setText(f"{ganancia:.3f}×  ({ganancia_db:+.2f} dB)")
-        L["df"].setText(f"{delta_f:+.2f} Hz")
+        ganancia = (r.v1_rms / r_entrada.v1_rms
+                    if r_entrada.v1_rms > 0 else float("nan"))
+        ganancia_db = (20.0 * np.log10(ganancia)
+                       if np.isfinite(ganancia) and ganancia > 0
+                       else float("nan"))
+        tiene_picos = np.isfinite(r.f1) and np.isfinite(r_entrada.f1)
+        delta_f = r.f1 - r_entrada.f1 if tiene_picos else float("nan")
+        delta_f_pct = (abs(delta_f) / r_entrada.f1
+                       if tiene_picos and r_entrada.f1 > 0 else float("inf"))
+        desfase = ((r.fase_fundamental - r_entrada.fase_fundamental + np.pi)
+                   % (2.0 * np.pi) - np.pi)
+        L["gain"].setText(
+            f"{ganancia:.3f}×  ({ganancia_db:+.2f} dB)"
+            if np.isfinite(ganancia_db) else "—")
+        L["df"].setText(f"{delta_f:+.2f} Hz" if tiene_picos else "—")
         L["phase"].setText(
             f"{np.degrees(desfase):+.1f}°" if delta_f_pct <= 0.01
             else "— (frecuencias distintas)")
@@ -1252,7 +1627,7 @@ class PestanaMedicion(QWidget):
         p_rms = r.v_rms_ac ** 2 / rl
         factor = 2.0 if self.cmb_alim.currentIndex() == 1 else 1.0
         p_dc = factor * vcc * idc
-        L["f1"].setText(fmt_si(r.f1, "Hz"))
+        L["f1"].setText(fmt_si(r.f1, "Hz") if np.isfinite(r.f1) else "—")
         L["vpp"].setText(fmt_si(r.v_pp, "V"))
         L["vpk"].setText(fmt_si(r.v_pico, "V"))
         L["vdc"].setText(fmt_si(r.v_dc, "V"))
@@ -1281,7 +1656,9 @@ class PestanaMedicion(QWidget):
         for i, (nombre, canal, resultado) in enumerate(comparaciones):
             thd = (f"{resultado.thd_pct:.4f} %"
                    if np.isfinite(resultado.thd_pct) else "—")
-            vals = [f"{nombre} ({canal})", fmt_si(resultado.f1, "Hz"),
+            frecuencia = (fmt_si(resultado.f1, "Hz")
+                          if np.isfinite(resultado.f1) else "—")
+            vals = [f"{nombre} ({canal})", frecuencia,
                     fmt_si(resultado.v_rms_ac, "V"), thd]
             for j, txt in enumerate(vals):
                 it = QTableWidgetItem(txt)
@@ -1329,6 +1706,7 @@ class VentanaPrincipal(QMainWindow):
         self.conexion.mensaje.connect(self.statusBar().showMessage)
         self.statusBar().showMessage(
             "Listo. Active el modo Simulador o conecte un osciloscopio para comparar entrada y salida.")
+        self.conexion.iniciar_deteccion_automatica()
 
     def closeEvent(self, ev):
         self.medicion.detener()
